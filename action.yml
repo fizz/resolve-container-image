@@ -8,7 +8,7 @@
 # Registry support: ECR (default). Other registries can be added.
 
 name: 'Resolve Container Image'
-description: 'Resolve a container image from explicit input, terraform state, or release branch. Prevents accidental image rollbacks during infra-only terraform applies.'
+description: 'Resolve a container image from explicit input, terraform state, or release branch. No more accidental rollbacks.'
 
 inputs:
   registry:
