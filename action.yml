@@ -1,0 +1,213 @@
+# Resolve a container image with priority: explicit > terraform state > release branch
+#
+# Called once per service. Priority chain:
+#   1. explicit_image provided?       -> parse and return
+#   2. update_images=false + state?   -> read from terraform state
+#   3. Otherwise                      -> resolve from latest releases/* branch
+#
+# Registry support: ECR (default). Other registries can be added.
+
+name: 'Resolve Container Image'
+description: 'Resolve a container image from explicit input, terraform state, or release branch. Prevents accidental image rollbacks during infra-only terraform applies.'
+
+inputs:
+  registry:
+    description: 'Container registry type (ecr)'
+    required: false
+    default: 'ecr'
+  registry_prefix:
+    description: 'Registry prefix (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com)'
+    required: true
+  image_repo:
+    description: 'Image repository name (e.g. myapp-api)'
+    required: true
+  github_repo:
+    description: 'GitHub repository name for release branch discovery (e.g. myapp)'
+    required: true
+  github_org:
+    description: 'GitHub org/user for release branch discovery'
+    required: true
+  explicit_image:
+    description: 'Override: repo:tag or repo:tag@sha256:digest'
+    required: false
+    default: ''
+  update_images:
+    description: 'Force resolve from release branch (skip state read)'
+    required: false
+    default: 'false'
+  release_branch:
+    description: 'Explicit branch; blank = auto-discover latest releases/*'
+    required: false
+    default: ''
+  terraform_resource_address:
+    description: 'Resource address for state read (e.g. module.api.kubernetes_deployment_v1.service)'
+    required: false
+    default: ''
+  terraform_working_dir:
+    description: 'Working dir for terraform show'
+    required: false
+    default: ''
+
+outputs:
+  repository:
+    description: 'Image repository URL'
+    value: ${{ steps.resolve.outputs.repository }}
+  tag:
+    description: 'Image tag'
+    value: ${{ steps.resolve.outputs.tag }}
+  digest:
+    description: 'Image digest (sha256:...)'
+    value: ${{ steps.resolve.outputs.digest }}
+  full_image:
+    description: 'Full image reference (repo:tag@digest)'
+    value: ${{ steps.resolve.outputs.full_image }}
+  source:
+    description: 'Resolution source: explicit, state, or release_branch'
+    value: ${{ steps.resolve.outputs.source }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: pip install --quiet aws-error-utils
+
+    - name: Resolve image
+      id: resolve
+      shell: bash
+      env:
+        IMAGE_REPO: ${{ inputs.image_repo }}
+        GITHUB_REPO: ${{ inputs.github_repo }}
+        EXPLICIT_IMAGE: ${{ inputs.explicit_image }}
+        UPDATE_IMAGES: ${{ inputs.update_images }}
+        RELEASE_BRANCH: ${{ inputs.release_branch }}
+        TF_RESOURCE_ADDRESS: ${{ inputs.terraform_resource_address }}
+        TF_WORKING_DIR: ${{ inputs.terraform_working_dir }}
+        GITHUB_ORG: ${{ inputs.github_org }}
+        REGISTRY_PREFIX: ${{ inputs.registry_prefix }}
+        REGISTRY: ${{ inputs.registry }}
+      run: |
+        set -euo pipefail
+
+        # --- Helpers ---
+
+        parse_image() {
+          local image="$1"
+          local digest=""
+
+          # Split off digest if present (repo:tag@sha256:abc)
+          if [[ "$image" == *"@"* ]]; then
+            digest="${image##*@}"
+            image="${image%%@*}"
+          fi
+
+          local repo="${image%:*}"
+          local tag="${image##*:}"
+
+          echo "repository=${repo}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          if [ -n "$digest" ]; then
+            echo "full_image=${repo}:${tag}@${digest}" >> "$GITHUB_OUTPUT"
+          else
+            echo "full_image=${repo}:${tag}" >> "$GITHUB_OUTPUT"
+          fi
+        }
+
+        # Registry-specific digest resolver
+        RESOLVE_SCRIPT="${GITHUB_ACTION_PATH}/ecr_resolve.py"
+
+        RESOLVED_SOURCE=""
+
+        # --- Priority 1: Explicit image ---
+
+        if [ -n "$EXPLICIT_IMAGE" ]; then
+          echo "::group::Using explicit image"
+          echo "Image: $EXPLICIT_IMAGE"
+          parse_image "$EXPLICIT_IMAGE"
+          RESOLVED_SOURCE="explicit"
+          echo "::endgroup::"
+
+        # --- Priority 2: Terraform state ---
+
+        elif [ "$UPDATE_IMAGES" != "true" ] && [ -n "$TF_RESOURCE_ADDRESS" ] && [ -n "$TF_WORKING_DIR" ]; then
+          echo "::group::Reading image from terraform state"
+
+          STATE_IMAGE=""
+          if terraform -chdir="$TF_WORKING_DIR" show -json 2>/dev/null | \
+            jq -r --arg addr "$TF_RESOURCE_ADDRESS" '
+              .values.root_module
+              | recurse(.child_modules[]?)
+              | .resources[]?
+              | select(.address == $addr)
+              | .values.spec[0].template[0].spec[0].container[0].image
+            ' 2>/dev/null | grep -v '^null$' | head -1 > /tmp/state_image.txt; then
+            STATE_IMAGE=$(cat /tmp/state_image.txt)
+          fi
+
+          if [ -n "$STATE_IMAGE" ]; then
+            echo "Found in state: $STATE_IMAGE"
+            parse_image "$STATE_IMAGE"
+            RESOLVED_SOURCE="state"
+          else
+            echo "No image found in state — falling through to release branch"
+          fi
+          echo "::endgroup::"
+        fi
+
+        # --- Priority 3: Release branch (fallthrough if nothing resolved above) ---
+
+        if [ -z "$RESOLVED_SOURCE" ]; then
+          echo "::group::Resolving from release branch"
+
+          if [ -z "$RELEASE_BRANCH" ]; then
+            RELEASE_BRANCH=$(gh api "repos/${GITHUB_ORG}/${GITHUB_REPO}/branches" \
+              --paginate -q '.[].name' | grep '^releases/' | sort -V | tail -1)
+            if [ -z "$RELEASE_BRANCH" ]; then
+              echo "::error::No releases/* branch found in ${GITHUB_ORG}/${GITHUB_REPO}"
+              exit 1
+            fi
+            echo "Auto-discovered release branch: $RELEASE_BRANCH"
+          else
+            echo "Using explicit release branch: $RELEASE_BRANCH"
+          fi
+
+          SHA=$(gh api "repos/${GITHUB_ORG}/${GITHUB_REPO}/branches/${RELEASE_BRANCH}" -q '.commit.sha')
+          if [ -z "$SHA" ]; then
+            echo "::error::Branch '$RELEASE_BRANCH' not found in ${GITHUB_ORG}/${GITHUB_REPO}"
+            exit 1
+          fi
+          echo "Branch HEAD: $SHA"
+
+          DIGEST=$(python3 "$RESOLVE_SCRIPT" "$IMAGE_REPO" "$SHA")
+
+          REPO="${REGISTRY_PREFIX}/${IMAGE_REPO}"
+          echo "Resolved: ${REPO}:${SHA}@${DIGEST}"
+
+          echo "repository=${REPO}" >> "$GITHUB_OUTPUT"
+          echo "tag=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "full_image=${REPO}:${SHA}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          RESOLVED_SOURCE="release_branch"
+          echo "::endgroup::"
+        fi
+
+        echo "source=${RESOLVED_SOURCE}" >> "$GITHUB_OUTPUT"
+
+        # --- Always verify digest ---
+        # Tags are mutable. If we resolved from state or explicit input
+        # without a digest, look it up from ECR to pin the image.
+
+        CURRENT_DIGEST=$(grep '^digest=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
+        CURRENT_TAG=$(grep '^tag=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
+        CURRENT_REPO=$(grep '^repository=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
+
+        if [ -z "$CURRENT_DIGEST" ] && [ -n "$CURRENT_TAG" ]; then
+          echo "::group::Resolving missing digest from registry"
+          REPO_NAME="${CURRENT_REPO##*/}"
+          LOOKED_UP_DIGEST=$(python3 "$RESOLVE_SCRIPT" "$REPO_NAME" "$CURRENT_TAG")
+          echo "Pinned digest: $LOOKED_UP_DIGEST"
+          echo "digest=${LOOKED_UP_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "full_image=${CURRENT_REPO}:${CURRENT_TAG}@${LOOKED_UP_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+        fi
