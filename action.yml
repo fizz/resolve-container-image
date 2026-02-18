@@ -9,8 +9,9 @@
 
 name: 'Resolve Container Image'
 description: 'Resolve a container image from explicit input, terraform state, or release branch. No more accidental rollbacks.'
-icon: 'anchor'
-color: 'blue'
+branding:
+  icon: 'anchor'
+  color: 'blue'
 
 inputs:
   registry:
