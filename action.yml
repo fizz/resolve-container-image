@@ -68,10 +68,6 @@ outputs:
     description: 'Resolution source: explicit, state, or release_branch'
     value: ${{ steps.resolve.outputs.source }}
 
-branding:
-  icon: 'anchor'
-  color: 'blue'
-
 runs:
   using: 'composite'
   steps:
