@@ -31,7 +31,7 @@ resolve from release branch
 ```yaml
 - name: Resolve API image
   id: api-image
-  uses: fizz/resolve-container-image@9c27cf991f61c66d6b21d6cc51266e1ee5f1b1f1 # v1.0.1
+  uses: fizz/resolve-container-image@6d68091b1da264a80c0ea979e3b313cb93bb317f # v1.0.2
   env:
     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   with:
