@@ -211,7 +211,7 @@ runs:
 
         if [ -z "$CURRENT_DIGEST" ] && [ -n "$CURRENT_TAG" ]; then
           echo "::group::Resolving missing digest from registry"
-          REPO_NAME="${CURRENT_REPO##*/}"
+          REPO_NAME="${CURRENT_REPO#*/}"
           LOOKED_UP_DIGEST=$(python3 "$RESOLVE_SCRIPT" "$REPO_NAME" "$CURRENT_TAG")
           echo "Pinned digest: $LOOKED_UP_DIGEST"
           echo "digest=${LOOKED_UP_DIGEST}" >> "$GITHUB_OUTPUT"
